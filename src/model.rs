@@ -1,31 +1,22 @@
 use std::collections::HashMap;
 use std::net::TcpStream;
 
-// Type alias for UserId -- user's unique identifier as a String (ip address of the user)
 pub type UserId = String;
 
-// Message struct representing a message in a conversation
 #[derive(Debug)]
 pub struct Message {
-    // UserId of the sender
     pub sender: UserId,
-    // Content of the message
     pub content: String,
 }
 
-// Type alias for ConversationId -- conversation's unique identifier as a String (name of the conversation)
 pub type ConversationId = String;
 
-// Conversation struct representing a chat conversation
 #[derive(Debug)]
 pub struct Conversation {
-    // List of UserIds participating in the conversation
     pub users: Vec<UserId>,
-    // List of messages in the conversation
     pub messages: Vec<Message>,
 }
 
-// In-memory database to store conversations
 #[derive(Debug)]
 pub struct InMemoryDB {
     pub conversations: HashMap<ConversationId, Conversation>,

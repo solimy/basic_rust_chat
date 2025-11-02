@@ -1,29 +1,38 @@
-use std::thread;
 use std::{
-    io::{BufReader, BufWriter, prelude::*},
+    io::{self, BufReader},
     net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread,
 };
 
-use std::sync::{Arc, Mutex};
-
 use crate::model;
+
+use crate::protocol::{chat, helpers::common::*, helpers::server::*};
+
+use flatbuffers::FlatBufferBuilder;
 
 pub fn serve(host: String, port: u16) {
     let db = Arc::new(Mutex::new(model::InMemoryDB::new()));
     let listener = TcpListener::bind(format!("{}:{}", host, port)).unwrap();
 
     println!("Server listening on {}:{}", host, port);
+
     for stream in listener.incoming() {
-        let stream = stream.unwrap();
-        let db_clone = Arc::clone(&db);
-        thread::spawn(move || {
-            handle_connection(stream, db_clone);
-        });
+        match stream {
+            Ok(stream) => {
+                let db_clone = Arc::clone(&db);
+                thread::spawn(move || handle_connection(stream, db_clone));
+            }
+            Err(e) => eprintln!("Accept error: {e}"),
+        }
     }
 }
 
 fn handle_connection(stream: TcpStream, db: Arc<Mutex<model::InMemoryDB>>) {
-    let user_id = stream.peer_addr().unwrap().to_string();
+    let user_id = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
 
     connection_opened(
         stream.try_clone().unwrap(),
@@ -31,212 +40,238 @@ fn handle_connection(stream: TcpStream, db: Arc<Mutex<model::InMemoryDB>>) {
         user_id.clone(),
     );
 
-    let read_stream = stream.try_clone().unwrap();
-    let mut buffered_reader = BufReader::new(&read_stream);
-    let mut line = String::new();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut current_conversation: Box<Option<String>> = Box::new(None);
 
-    let command = match buffered_reader.read_line(&mut line) {
-        Ok(_) => line.clone().trim_end().to_string(),
-        Err(_) => {
-            eprintln!("Failed to read command from client.");
-            return;
-        }
-    };
-
-    match command.as_str() {
-        "list" => handle_list(stream.try_clone().unwrap(), Arc::clone(&db), &user_id),
-        "join" => {
-            if let Some(conversation_id) = handle_join(
-                stream.try_clone().unwrap(),
-                &mut buffered_reader,
-                Arc::clone(&db),
-                &user_id,
-            ) {
-                handle_leave(Arc::clone(&db), &user_id, &conversation_id);
+    loop {
+        let frame_bytes = match read_frame(&mut reader) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                eprintln!("Read error from {user_id}: {e}");
+                break;
             }
-        }
-        _ => {
-            eprintln!("Unknown command received: {}", command);
+        };
+
+        let env = match chat::root_as_envelope(&frame_bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                if let Ok(mut s) = stream.try_clone() {
+                    let mut fbb = FlatBufferBuilder::new();
+                    let env = env_with_error(&mut fbb, &format!("Bad envelope: {e}"));
+                    fbb.finish(env, None);
+                    let _ = write_frame(&mut s, fbb.finished_data());
+                }
+                continue;
+            }
+        };
+
+        match env.frame_type() {
+            chat::Message::ListRequest => handle_list_request(&db, &stream),
+
+            chat::Message::JoinRequest => handle_join_request(
+                &db,
+                &stream,
+                &user_id,
+                &env.frame_as_join_request().expect("JoinRequest"),
+                &mut current_conversation,
+            ),
+
+            chat::Message::ClientText => handler_client_text(
+                &stream,
+                &db,
+                &user_id,
+                &env.frame_as_client_text().expect("ClientText"),
+                &current_conversation,
+            ),
+
+            _ => {
+                if let Ok(mut s) = stream.try_clone() {
+                    let mut fbb = FlatBufferBuilder::new();
+                    let env = env_with_error(&mut fbb, "Unsupported message type to server");
+                    fbb.finish(env, None);
+                    let _ = write_frame(&mut s, fbb.finished_data());
+                }
+            }
         }
     }
 
+    if let Some(conv_id) = current_conversation.as_ref() {
+        handle_leave(Arc::clone(&db), &user_id, &conv_id);
+    }
     connection_closed(Arc::clone(&db), &user_id);
 }
 
 fn connection_opened(stream: TcpStream, db: Arc<Mutex<model::InMemoryDB>>, user_id: String) {
-    if let Ok(mut locked_db) = db.lock() {
-        locked_db
-            .connections
+    {
+        let mut dbm = db.lock().unwrap();
+        dbm.connections
             .insert(user_id.clone(), stream.try_clone().unwrap());
     }
     println!("New connection from {}", user_id);
 }
 
 fn connection_closed(db: Arc<Mutex<model::InMemoryDB>>, user_id: &String) {
-    if let Ok(mut locked_db) = db.lock() {
-        locked_db.connections.remove(user_id);
+    {
+        let mut dbm = db.lock().unwrap();
+        dbm.connections.remove(user_id);
     }
     println!("Connection from {} closed.", user_id);
 }
 
-fn handle_list(mut stream: TcpStream, db: Arc<Mutex<model::InMemoryDB>>, user_id: &String) {
-    if let Ok(locked_db) = db.lock() {
-        println!("Listing conversations for user {}", user_id);
-        let count = locked_db.conversations.len();
-        stream
-            .write_all(format!("Total conversations: {}\n", count).as_bytes())
-            .unwrap();
-        for (conv_id, conv) in locked_db.conversations.iter() {
-            stream
-                .write_all(
-                    format!(
-                        "Conversation ID: {}, Users: {}, Messages: {}\n",
-                        conv_id,
-                        conv.users.len(),
-                        conv.messages.len()
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-        }
-        return;
-    } else {
-        eprintln!("Failed to lock the database for listing conversations.");
-        return;
-    }
-}
-
-fn handle_join(
-    mut stream: TcpStream,
-    buffered_reader: &mut BufReader<&TcpStream>,
-    db: Arc<Mutex<model::InMemoryDB>>,
-    user_id: &String,
-) -> Option<String> {
-    let mut line = String::new();
-    let conversation_id = match buffered_reader.read_line(&mut line) {
-        Ok(_) => line.clone().trim_end().to_string(),
-        Err(_) => {
-            eprintln!("Failed to read conversation ID from client.");
-            return None;
-        }
+fn broadcast_chat(
+    db: &Arc<Mutex<model::InMemoryDB>>,
+    conv_id: &str,
+    text: &str,
+    skip_user: Option<&str>,
+) {
+    let sinks: Vec<TcpStream> = {
+        let dbm = db.lock().unwrap();
+        let Some(conv) = dbm.conversations.get(conv_id) else {
+            return;
+        };
+        conv.users
+            .iter()
+            .filter(|uid| skip_user.map_or(true, |s| *uid != s))
+            .filter_map(|uid| dbm.connections.get(uid))
+            .filter_map(|s| s.try_clone().ok())
+            .collect()
     };
 
-    println!(
-        "User {} is joining conversation {}",
-        user_id, conversation_id
-    );
+    let mut fbb = FlatBufferBuilder::new();
+    let env = env_with_chat(&mut fbb, text);
+    fbb.finish(env, None);
+    let bytes = fbb.finished_data();
 
-    if let Ok(mut locked_db) = db.lock() {
-        if !locked_db.conversations.contains_key(&conversation_id) {
-            println!(
-                "Conversation {} does not exist. Creating a new one.",
-                conversation_id
-            );
-
-            locked_db.conversations.insert(
-                conversation_id.clone(),
-                model::Conversation::new(user_id.clone()),
-            );
-
-            println!(
-                "Conversation {} created by user {}",
-                conversation_id, user_id
-            );
-        } else {
-            let conversation = locked_db.conversations.get_mut(&conversation_id).unwrap();
-            if !conversation.users.contains(&user_id) {
-                conversation.users.push(user_id.clone());
-                println!("User {} added to conversation {}", user_id, conversation_id);
-            }
-            for msg in &conversation.messages {
-                println!(
-                    "Sending history to {}: [{}] {}: {}",
-                    user_id, conversation_id, msg.sender, msg.content
-                );
-                stream
-                    .write_all(
-                        format!("[{}] {}: {}\n", conversation_id, msg.sender, msg.content)
-                            .as_bytes(),
-                    )
-                    .unwrap();
-            }
-            for (uid, mut conn) in &locked_db.connections {
-                if uid != user_id {
-                    conn.write_all(
-                        format!(
-                            "User {} has joined the conversation {}\n",
-                            user_id, conversation_id
-                        )
-                        .as_bytes(),
-                    )
-                    .unwrap();
-                }
-            }
-        }
+    for mut sink in sinks {
+        let _ = write_frame(&mut sink, bytes);
     }
-
-    line.clear();
-    while let Ok(len) = buffered_reader.read_line(&mut line) {
-        if len == 0 {
-            break;
-        }
-        let message = model::Message::new(user_id.clone(), line.clone().trim_end().to_string());
-
-        if let Ok(mut locked_db) = db.lock() {
-            let conversation = locked_db.conversations.get_mut(&conversation_id).unwrap();
-            conversation.add_message(message);
-        }
-
-        if let Ok(locked_db) = db.lock() {
-            for uid in &locked_db.conversations.get(&conversation_id).unwrap().users {
-                if let Some(conn) = locked_db.connections.get(uid) {
-                    let mut writer = BufWriter::new(conn);
-                    writer
-                        .write_all(
-                            format!("[{}] {}: {}\n", conversation_id, user_id, line.trim_end())
-                                .as_bytes(),
-                        )
-                        .unwrap();
-                }
-            }
-        }
-
-        println!("[{}] {}: {}", conversation_id, user_id, line.trim_end());
-        line.clear();
-    }
-    Some(conversation_id)
 }
 
 fn handle_leave(db: Arc<Mutex<model::InMemoryDB>>, user_id: &String, conversation_id: &String) {
-    if let Ok(locked_db) = db.lock() {
-        let conversation = locked_db.conversations.get(conversation_id).unwrap();
-        for uid in &conversation.users {
-            if let Some(conn) = locked_db.connections.get(uid) {
-                let mut writer = BufWriter::new(conn);
-                writer
-                    .write_all(
-                        format!(
-                            "User {} has left the conversation {}\n",
-                            user_id, conversation_id
-                        )
-                        .as_bytes(),
-                    )
-                    .unwrap();
+    broadcast_chat(
+        &db,
+        conversation_id,
+        &format!(
+            "User {} has left the conversation {}",
+            user_id, conversation_id
+        ),
+        Some(user_id),
+    );
+
+    {
+        let mut dbm = db.lock().unwrap();
+        if let Some(conv) = dbm.conversations.get_mut(conversation_id) {
+            conv.users.retain(|uid| uid != user_id);
+            if conv.users.is_empty() {
+                println!(
+                    "No more users in conversation {}. Deleting conversation.",
+                    conversation_id
+                );
+                dbm.conversations.remove(conversation_id);
             }
         }
+        dbm.connections.remove(user_id);
     }
-    if let Ok(mut locked_db) = db.lock() {
-        let conversation = locked_db.conversations.get_mut(conversation_id).unwrap();
+}
 
-        conversation.users.retain(|uid| uid != user_id);
+fn handle_list_request(db: &Arc<Mutex<model::InMemoryDB>>, stream: &TcpStream) {
+    let summaries: Vec<(String, usize, usize)> = {
+        let db = db.lock().unwrap();
+        db.conversations
+            .iter()
+            .map(|(id, conv)| (id.clone(), conv.users.len(), conv.messages.len()))
+            .collect()
+    };
+    let mut fbb = FlatBufferBuilder::new();
+    let env = env_with_list_response(&mut fbb, &summaries);
+    fbb.finish(env, None);
+    let _ = write_frame(&mut stream.try_clone().unwrap(), fbb.finished_data());
+}
 
-        if conversation.users.is_empty() {
-            println!(
-                "No more users in conversation {}. Deleting conversation.",
-                conversation_id
-            );
-            locked_db.conversations.remove(conversation_id);
+fn handle_join_request(
+    db: &Arc<Mutex<model::InMemoryDB>>,
+    stream: &TcpStream,
+    user_id: &String,
+    jr: &chat::JoinRequest,
+    current_conversation: &mut Box<Option<String>>,
+) {
+    let conv_id = jr.conversation_id().unwrap_or_default().to_string();
+    println!("User {user_id} joining {conv_id}");
+
+    {
+        let mut dbm = db.lock().unwrap();
+        let conv = dbm
+            .conversations
+            .entry(conv_id.clone())
+            .or_insert_with(|| model::Conversation::new(user_id.clone()));
+        if !conv.users.contains(&user_id) {
+            conv.users.push(user_id.clone());
         }
-        locked_db.connections.remove(user_id);
     }
+
+    let history: Vec<String> = {
+        let dbm = db.lock().unwrap();
+        dbm.conversations
+            .get(&conv_id)
+            .map(|c| {
+                c.messages
+                    .iter()
+                    .map(|m| format!("[{}] {}: {}", conv_id, m.sender, m.content))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if let Ok(mut s) = stream.try_clone() {
+        for line in history {
+            let mut fbb = FlatBufferBuilder::new();
+            let env = env_with_chat(&mut fbb, &line);
+            fbb.finish(env, None);
+            let _ = write_frame(&mut s, fbb.finished_data());
+        }
+    }
+
+    broadcast_chat(
+        &db,
+        &conv_id,
+        &format!("User {} has joined the conversation {}", user_id, conv_id),
+        Some(&user_id),
+    );
+
+    current_conversation.replace(conv_id);
+}
+
+fn handler_client_text(
+    stream: &TcpStream,
+    db: &Arc<Mutex<model::InMemoryDB>>,
+    user_id: &String,
+    ct: &chat::ClientText,
+    current_conversation: &Box<Option<String>>,
+) {
+    let Some(conv_id) = current_conversation.as_ref() else {
+        if let Ok(mut s) = stream.try_clone() {
+            let mut fbb = FlatBufferBuilder::new();
+            let env = env_with_error(&mut fbb, "Send JoinRequest before ClientText");
+            fbb.finish(env, None);
+            let _ = write_frame(&mut s, fbb.finished_data());
+        }
+        return;
+    };
+
+    let text = ct.text().unwrap_or_default();
+
+    {
+        let mut dbm = db.lock().unwrap();
+        let conv = dbm.conversations.get_mut(conv_id).unwrap();
+        conv.add_message(model::Message::new(user_id.clone(), text.to_string()));
+    }
+
+    broadcast_chat(
+        &db,
+        &conv_id,
+        &format!("[{}] {}: {}", conv_id, user_id, text),
+        None,
+    );
+
+    println!("[{}] {}: {}", conv_id, user_id, text);
 }

@@ -1,5 +1,6 @@
 mod client;
 mod model;
+mod protocol;
 mod server;
 
 use clap::{Parser, Subcommand};
