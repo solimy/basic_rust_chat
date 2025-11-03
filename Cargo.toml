@@ -2,8 +2,8 @@
 name = "basic_rust_chat"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [dependencies]
+bincode = { version = "2.0.1", features = ["derive"] }
 clap = { version = "4.5.51", features = ["derive"] }
-flatbuffers = "25.9.23"
+derive_more = { version = "2.0.1", features = ["from"] }
